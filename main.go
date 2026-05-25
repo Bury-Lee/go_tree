@@ -12,6 +12,14 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
 )
 
 // FileNode 表示文件或目录节点
@@ -21,7 +29,7 @@ type FileNode struct {
 	Size     uint64
 	IsDir    bool
 	Children []*FileNode
-	Percent  float64 // 占总大小的百分比
+	Percent  float64
 }
 
 // formatSize 格式化字节数为 B/KB/MB/GB
@@ -36,63 +44,62 @@ func formatSize(bytes uint64) string {
 	return fmt.Sprintf("%.2f %s", size, units[unit])
 }
 
-// hashPath 生成路径的简短唯一ID（用于HTML折叠）
+// hashPath 生成路径的简短唯一ID
 func hashPath(path string) string {
 	h := sha256.Sum256([]byte(path))
 	return "toggle_" + hex.EncodeToString(h[:])[:8]
 }
 
-// buildTree 构建带大小缓存的树结构
+// buildTree 构建文件树
 func buildTree(root string) (*FileNode, error) {
 	sizeCache := make(map[string]uint64)
+	totalSize := uint64(0)
 
-	var walk func(string, fs.FileInfo) error
-	walk = func(path string, info fs.FileInfo) error {
+	// 第一次遍历：计算大小
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
 		if info.IsDir() {
-			var total uint64
-			err := filepath.WalkDir(path, func(subPath string, d fs.DirEntry, err error) error {
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "无法访问: %s (%v)\n", subPath, err)
-					return nil // 跳过错误
+			dirSize := uint64(0)
+			filepath.WalkDir(path, func(subPath string, subD fs.DirEntry, subErr error) error {
+				if subErr != nil {
+					return nil
 				}
-				if d.IsDir() {
-					return nil // 不递归进子目录（由外层控制）
-				}
-				if f, err := d.Info(); err == nil {
-					total += uint64(f.Size())
+				if !subD.IsDir() {
+					if f, err := subD.Info(); err == nil {
+						dirSize += uint64(f.Size())
+					}
 				}
 				return nil
 			})
-			if err != nil {
-				return err
-			}
-			sizeCache[path] = total
+			sizeCache[path] = dirSize
 		} else {
 			sizeCache[path] = uint64(info.Size())
 		}
 		return nil
-	}
-
-	// 第一次遍历：填充 sizeCache
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "跳过路径: %s (%v)\n", path, err)
-			return nil
-		}
-		info, _ := d.Info()
-		return walk(path, info)
 	})
+
 	if err != nil {
 		return nil, err
 	}
 
-	totalSize := sizeCache[root]
+	totalSize = sizeCache[root]
 
-	// 第二次构建树结构（带排序）
+	// 第二次遍历：构建树结构
 	var build func(string) *FileNode
 	build = func(path string) *FileNode {
 		info, _ := os.Stat(path)
 		name := filepath.Base(path)
+		if name == "" {
+			name = path
+		}
 		size := sizeCache[path]
 		isDir := info.IsDir()
 		node := &FileNode{
@@ -109,7 +116,6 @@ func buildTree(root string) (*FileNode, error) {
 		if isDir {
 			entries, err := os.ReadDir(path)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "⚠️ 无法读取目录: %s (%v)\n", path, err)
 				return node
 			}
 
@@ -120,7 +126,6 @@ func buildTree(root string) (*FileNode, error) {
 				children = append(children, child)
 			}
 
-			// 排序：先按大小降序，再按名称升序
 			sort.Slice(children, func(i, j int) bool {
 				if children[i].Size != children[j].Size {
 					return children[i].Size > children[j].Size
@@ -137,16 +142,6 @@ func buildTree(root string) (*FileNode, error) {
 	return rootNode, nil
 }
 
-// escapeJS 转义字符串用于 JavaScript（简单版）
-func escapeJS(s string) string {
-	s = strings.ReplaceAll(s, "\\", "\\\\")
-	s = strings.ReplaceAll(s, "'", "\\'")
-	s = strings.ReplaceAll(s, "\"", "\\\"")
-	s = strings.ReplaceAll(s, "\n", "\\n")
-	return s
-}
-
-// toHTMLString 手动转义 HTML（因为 template 会自动转义，但我们需要部分不转义）
 func toHTMLString(s string) template.HTML {
 	return template.HTML(html.EscapeString(s))
 }
@@ -170,7 +165,7 @@ const htmlTemplate = `
             border-radius: 10px;
             padding: 25px;
             box-shadow: 0 4px 15px rgba(0,0,0,0.1);
-            max-width: 1000px;
+            max-width: 1200px;
             margin: auto;
         }
         h1 {
@@ -305,7 +300,7 @@ type PageData struct {
 	CurrentTime  string
 }
 
-func generateHTML(rootNode *FileNode, outputPath string) error {
+func generateHTML(rootNode *FileNode) (string, error) {
 	data := PageData{
 		RootName:     rootNode.Name,
 		Nodes:        []*FileNode{rootNode},
@@ -314,43 +309,322 @@ func generateHTML(rootNode *FileNode, outputPath string) error {
 		CurrentTime:  time.Now().Format("2006-01-02 15:04:05"),
 	}
 
-	file, err := os.Create(outputPath)
+	var htmlBuilder strings.Builder
+	err := tpl.Execute(&htmlBuilder, data)
 	if err != nil {
-		return fmt.Errorf("无法创建输出文件: %w", err)
+		return "", err
 	}
-	defer file.Close()
+	return htmlBuilder.String(), nil
+}
 
-	return tpl.Execute(file, data)
+// GUI 应用
+type GUI struct {
+	window      fyne.Window
+	app         fyne.App
+	dirEntry    *widget.Entry
+	outputEntry *widget.Entry
+	progressBar *widget.ProgressBar
+	statusLabel *widget.Label
+	rootNode    *FileNode
+	htmlContent string
+	selectBtn   *widget.Button
+	generateBtn *widget.Button
+	saveBtn     *widget.Button
+	previewBtn  *widget.Button
 }
 
 func main() {
-	if len(os.Args) != 3 {
-		fmt.Fprintf(os.Stderr, "用法: %s <根目录路径> <输出HTML文件>\n", os.Args[0])
-		os.Exit(1)
+	gui := &GUI{}
+	gui.app = app.NewWithID("com.filetree.viewer")
+	gui.app.SetIcon(theme.FolderIcon())
+
+	gui.window = gui.app.NewWindow("文件结构树生成器")
+	gui.window.Resize(fyne.NewSize(600, 400))
+
+	gui.setupUI()
+	gui.window.ShowAndRun()
+}
+
+func (g *GUI) setupUI() {
+	// 标题
+	titleLabel := widget.NewLabelWithStyle("📁 文件结构树生成器",
+		fyne.TextAlignCenter,
+		fyne.TextStyle{Bold: true})
+
+	// 目录选择
+	g.dirEntry = widget.NewEntry()
+	g.dirEntry.SetPlaceHolder("选择要扫描的目录...")
+
+	g.selectBtn = widget.NewButtonWithIcon("选择目录", theme.FolderOpenIcon(), func() {
+		g.selectDirectory()
+	})
+
+	dirBox := container.NewBorder(nil, nil, nil, g.selectBtn, g.dirEntry)
+
+	// 输出文件路径
+	g.outputEntry = widget.NewEntry()
+	g.outputEntry.SetPlaceHolder("输出HTML文件路径...")
+
+	g.saveBtn = widget.NewButtonWithIcon("保存位置", theme.DocumentSaveIcon(), func() {
+		g.selectOutputFile()
+	})
+
+	outputBox := container.NewBorder(nil, nil, nil, g.saveBtn, g.outputEntry)
+
+	// 控制按钮
+	g.generateBtn = widget.NewButtonWithIcon("生成文件树", theme.MediaPlayIcon(), func() {
+		g.generateTree()
+	})
+
+	g.previewBtn = widget.NewButtonWithIcon("预览", theme.SearchIcon(), func() {
+		g.showPreview()
+	})
+	g.previewBtn.Disable()
+
+	// 进度条和状态
+	g.progressBar = widget.NewProgressBar()
+	g.progressBar.Hide()
+
+	g.statusLabel = widget.NewLabel("就绪")
+
+	// 布局
+	content := container.NewVBox(
+		titleLabel,
+		widget.NewSeparator(),
+		widget.NewLabel("源目录:"),
+		dirBox,
+		widget.NewLabel("输出文件:"),
+		outputBox,
+		container.NewHBox(
+			g.generateBtn,
+			g.previewBtn,
+			layout.NewSpacer(),
+		),
+		g.progressBar,
+		g.statusLabel,
+	)
+
+	g.window.SetContent(content)
+}
+
+func (g *GUI) selectDirectory() {
+	dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
+		if err != nil {
+			dialog.ShowError(err, g.window)
+			return
+		}
+		if uri == nil {
+			return
+		}
+		g.dirEntry.SetText(uri.Path())
+		// 自动设置输出文件路径
+		if g.outputEntry.Text == "" {
+			defaultOutput := filepath.Join(uri.Path(), "file_tree.html")
+			g.outputEntry.SetText(defaultOutput)
+		}
+	}, g.window)
+}
+
+func (g *GUI) selectOutputFile() {
+	dialog.ShowFileSave(func(writer fyne.URIWriteCloser, err error) {
+		if err != nil {
+			dialog.ShowError(err, g.window)
+			return
+		}
+		if writer == nil {
+			return
+		}
+		g.outputEntry.SetText(writer.URI().Path())
+		writer.Close()
+	}, g.window)
+}
+
+func (g *GUI) generateTree() {
+	rootPath := g.dirEntry.Text
+	if rootPath == "" {
+		dialog.ShowInformation("提示", "请先选择要扫描的目录", g.window)
+		return
 	}
 
-	rootPath := os.Args[1]
-	outputHTML := os.Args[2]
+	// 禁用按钮
+	g.generateBtn.Disable()
+	g.selectBtn.Disable()
 
-	if _, err := os.Stat(rootPath); os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "路径不存在: %s\n", rootPath)
-		os.Exit(1)
+	// 显示进度条
+	g.progressBar.Show()
+	g.progressBar.SetValue(0)
+	g.statusLabel.SetText("正在扫描目录...")
+
+	// 在后台线程中处理
+	go func() {
+		rootNode, err := buildTree(rootPath)
+
+		// 使用 fyne.Do 在主线程更新 UI
+		fyne.Do(func() {
+			defer func() {
+				g.generateBtn.Enable()
+				g.selectBtn.Enable()
+				g.progressBar.Hide()
+			}()
+
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("扫描失败: %v", err), g.window)
+				g.statusLabel.SetText("扫描失败")
+				return
+			}
+
+			g.rootNode = rootNode
+			g.progressBar.SetValue(0.5)
+			g.statusLabel.SetText("正在生成HTML...")
+
+			// 生成 HTML
+			htmlContent, err := generateHTML(rootNode)
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("生成HTML失败: %v", err), g.window)
+				g.statusLabel.SetText("生成失败")
+				return
+			}
+
+			g.htmlContent = htmlContent
+			g.progressBar.SetValue(1)
+			g.statusLabel.SetText(fmt.Sprintf("✅ 完成 - 总大小: %s", formatSize(rootNode.Size)))
+
+			// 启用预览按钮
+			g.previewBtn.Enable()
+
+			// 询问是否保存
+			if g.outputEntry.Text != "" {
+				dialog.ShowConfirm("保存文件",
+					fmt.Sprintf("文件树已生成！\n总大小: %s\n\n是否保存HTML文件到:\n%s",
+						formatSize(rootNode.Size), g.outputEntry.Text),
+					func(save bool) {
+						if save {
+							g.saveHTML()
+						}
+					}, g.window)
+			}
+		})
+	}()
+}
+
+func (g *GUI) saveHTML() {
+	outputPath := g.outputEntry.Text
+	if outputPath == "" {
+		dialog.ShowFileSave(func(writer fyne.URIWriteCloser, err error) {
+			if err != nil {
+				dialog.ShowError(err, g.window)
+				return
+			}
+			if writer == nil {
+				return
+			}
+			outputPath = writer.URI().Path()
+			writer.Close()
+			g.outputEntry.SetText(outputPath)
+			g.doSave(outputPath)
+		}, g.window)
+	} else {
+		g.doSave(outputPath)
+	}
+}
+
+func (g *GUI) doSave(outputPath string) {
+	if g.htmlContent == "" {
+		dialog.ShowError(fmt.Errorf("没有可保存的内容"), g.window)
+		return
 	}
 
-	fmt.Printf("正在扫描目录: %s\n", rootPath)
-	rootNode, err := buildTree(rootPath)
+	err := os.WriteFile(outputPath, []byte(g.htmlContent), 0644)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "扫描失败: %v\n", err)
-		os.Exit(1)
+		dialog.ShowError(fmt.Errorf("保存失败: %v", err), g.window)
+		return
 	}
 
-	err = generateHTML(rootNode, outputHTML)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "生成 HTML 失败: %v\n", err)
-		os.Exit(1)
+	dialog.ShowInformation("成功",
+		fmt.Sprintf("HTML文件已保存到:\n%s\n\n总大小: %s",
+			outputPath, formatSize(g.rootNode.Size)), g.window)
+}
+
+func (g *GUI) showPreview() {
+	if g.rootNode == nil {
+		dialog.ShowInformation("提示", "请先生成文件树", g.window)
+		return
 	}
 
-	fmt.Printf("\nHTML 文件已生成: %s\n", outputHTML)
-	fmt.Printf("扫描路径: %s\n", rootPath)
-	fmt.Printf("总大小: %s\n", formatSize(rootNode.Size))
+	// 创建预览窗口
+	previewWin := g.app.NewWindow("文件树预览 - " + g.rootNode.Name)
+	previewWin.Resize(fyne.NewSize(700, 600))
+
+	// 生成树形文本
+	treeText := g.buildTreeText(g.rootNode, 0)
+
+	previewContent := widget.NewLabel(treeText)
+	previewContent.Wrapping = fyne.TextWrapOff
+
+	scroll := container.NewScroll(previewContent)
+
+	// 添加保存按钮
+	saveBtn := widget.NewButtonWithIcon("保存HTML", theme.DocumentSaveIcon(), func() {
+		g.saveHTML()
+		previewWin.Close()
+	})
+
+	content := container.NewBorder(
+		container.NewVBox(
+			widget.NewLabelWithStyle(fmt.Sprintf("📁 %s", g.rootNode.Name),
+				fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			widget.NewLabel(fmt.Sprintf("💾 总大小: %s", formatSize(g.rootNode.Size))),
+			widget.NewLabel(fmt.Sprintf("📊 文件/目录总数: %d", countNodes(g.rootNode))),
+			widget.NewSeparator(),
+		),
+		container.NewHBox(
+			layout.NewSpacer(),
+			saveBtn,
+		),
+		nil, nil,
+		scroll,
+	)
+
+	previewWin.SetContent(content)
+	previewWin.Show()
+}
+
+func (g *GUI) buildTreeText(node *FileNode, level int) string {
+	indent := strings.Repeat("  ", level)
+	var result strings.Builder
+
+	if node.IsDir {
+		if len(node.Children) == 0 {
+			result.WriteString(fmt.Sprintf("%s📁 %s/ (%s, %.1f%%) [空目录]\n",
+				indent, node.Name, formatSize(node.Size), node.Percent))
+		} else {
+			result.WriteString(fmt.Sprintf("%s📁 %s/ (%s, %.1f%%)\n",
+				indent, node.Name, formatSize(node.Size), node.Percent))
+			for _, child := range node.Children {
+				result.WriteString(g.buildTreeText(child, level+1))
+			}
+		}
+	} else {
+		// 大文件用红色标记
+		marker := ""
+		if node.Percent > 10 {
+			marker = " 🔴"
+		} else if node.Percent > 5 {
+			marker = " 🟡"
+		}
+		result.WriteString(fmt.Sprintf("%s📄 %s (%s, %.1f%%)%s\n",
+			indent, node.Name, formatSize(node.Size), node.Percent, marker))
+	}
+
+	return result.String()
+}
+
+func countNodes(node *FileNode) int {
+	count := 1
+	if node.IsDir {
+		for _, child := range node.Children {
+			count += countNodes(child)
+		}
+	}
+	return count
 }
